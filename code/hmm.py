@@ -302,18 +302,29 @@ class HiddenMarkovModel:
             tag_i, word_i = isent[i]
             next_tag_i, _ = isent[i + 1]
             
-            # Increment the transition count between consecutive tags
-            self.A_counts[tag_i, next_tag_i] += mult
+            # Ensure none of the indices are None before proceeding
+            if tag_i is None or word_i is None or next_tag_i is None:
+                continue
+
+            # Increment the transition count between consecutive tags, excluding transitions to BOS_TAG and from EOS_TAG
+            if tag_i < self.k and next_tag_i < self.k and next_tag_i != self.bos_t and tag_i != self.eos_t:
+                self.A_counts[tag_i, next_tag_i] += mult
             
             # Increment the emission count for the current tag emitting the current word
-            self.B_counts[tag_i, word_i] += mult
-        
+            if tag_i < self.k and word_i < self.V and tag_i != self.eos_t and tag_i != self.bos_t:
+                # Only count emissions for non-EOS and non-BOS tags
+                self.B_counts[tag_i, word_i] += mult
+
         # Handle the transition from BOS to the first tag and the transition to EOS
         first_tag, _ = isent[0]
         last_tag, _ = isent[-1]
+
+        # Ensure first_tag and last_tag are not None before updating counts
+        if self.bos_t is not None and first_tag is not None and first_tag < self.k:
+            self.A_counts[self.bos_t, first_tag] += mult  # Transition from BOS to the first tag
+        if last_tag is not None and self.eos_t is not None and last_tag < self.k:
+            self.A_counts[last_tag, self.eos_t] += mult  # Transition from the last tag to EOS
         
-        self.A_counts[self.bos_t, first_tag] += mult  # Transition from BOS to the first tag
-        self.A_counts[last_tag, self.eos_t] += mult
 
     @typechecked
     def forward_pass(self, isent: IntegerizedSentence) -> TorchScalar:
@@ -331,16 +342,45 @@ class HiddenMarkovModel:
         # But to better match the notation in the handout, we'll instead
         # preallocate a list alpha of length n+2 so that we can assign 
         # directly to each alpha[j] in turn.
-        alpha = [torch.empty(self.k) for _ in isent]    
-        alpha[0] = self.eye[self.bos_t]  # vector that is one-hot at BOS_TAG
+        # Number of words in the sentence (excluding BOS and EOS)
+        n = len(isent) - 1
+        
+        # Preallocate alpha for each position; alpha[0] corresponds to BOS
+        alpha = [torch.full((self.k,), float('-inf')) for _ in range(n + 2)]
+        alpha[0][self.bos_t] = 0.0  # Start with log-prob 0 at BOS (log(1) = 0)
 
+        # Transition and emission matrices in log-space to prevent underflow
+        log_A = torch.log(self.A)
+        log_B = torch.log(self.B)
+        
+        # Forward algorithm to compute alpha values
+        for j in range(1, n + 2):
+            if j < n + 1:
+                w_j = isent[j][0]  # Current word index
+                if w_j < self.V:  # Only proceed if w_j is within bounds for log_B
+                    emit_probs = log_B[:, w_j]  # Emission probabilities for word w_j
+                else:
+                    emit_probs = torch.zeros(self.k)  # Set to zero if it's BOS or EOS
+            else:
+                # For EOS, there is no word emission; treat emission probability as 0 (log(1) = 0)
+                emit_probs = torch.zeros(self.k)
+            
+            # For each current tag t, compute alpha[t] by summing over all previous tags
+            for t in range(self.k):
+                alpha_prev = alpha[j - 1] + log_A[:, t]  # Transition from all tags to t
+                alpha[j][t] = torch.logsumexp(alpha_prev + emit_probs[t], dim=0)
+
+        # Log-probability of the entire sentence is in the EOS tag position at the end
+        log_Z = alpha[-1][self.eos_t]  # log Z = log probability of observing the sentence
+        
+        # Store alpha values for potential backward pass
+        self.alpha = alpha
+
+        return log_Z
             # Note: once you have this working on the ice cream data, you may
             # have to modify this design slightly to avoid underflow on the
             # English tagging data. See section C in the reading handout.
-        
-        raise NotImplementedError   # you fill this in!
 
-        return log_Z
 
     @typechecked
     def backward_pass(self, isent: IntegerizedSentence, mult: float = 1) -> TorchScalar:
