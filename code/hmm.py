@@ -331,30 +331,55 @@ class HiddenMarkovModel:
         """Find the most probable tagging for the given sentence, according to the
         current model."""
 
-        # Note: This code is mainly copied from the forward algorithm.
-        # We just switch to using max, and follow backpointers.
-        # The code continues to use the name alpha, rather than \hat{alpha}
-        # as in the handout.
-
-        # We'll start by integerizing the input Sentence. You'll have to
-        # deintegerize the words and tags again when constructing the return
-        # value, since the type annotation on this method says that it returns a
-        # Sentence object, and that's what downstream methods like eval_tagging
-        # will expect.  (Running mypy on your code will check that your code
-        # conforms to the type annotations ...)
-
         isent = self._integerize_sentence(sentence, corpus)
+        n = len(isent) - 1
+        k = self.k
 
-        # See comments in log_forward on preallocation of alpha.
-        alpha        = [torch.empty(self.k)                  for _ in isent]  
-        backpointers = [torch.empty(self.k, dtype=torch.int) for _ in isent]
-        tags: List[int]    # you'll put your integerized tagging here
+        # Initialize alpha_hat (max probabilities) and backpointers
+        alpha = [torch.full((k,), float('-inf')) for _ in isent]
+        backpointers = [torch.zeros(k, dtype=torch.long) for _ in isent]
 
-        raise NotImplementedError   # you fill this in!
+        # Log probabilities to prevent underflow
+        log_A = torch.log(self.A)
+        log_B = torch.log(self.B)
 
-        # Make a new tagged sentence with the old words and the chosen tags
-        # (using self.tagset to deintegerize the chosen tags).
-        return Sentence([(word, self.tagset[tags[j]]) for j, (word, tag) in enumerate(sentence)])
+         # Initialization at position 0 (BOS)
+        alpha[0][self.bos_t] = 0.0
+        # Viterbi algorithm
+        for j in range(1, len(isent)):
+            w_j = isent[j][0]  # Word index at position j
+            # Compute emission probabilities
+            if w_j < self.V:
+                emit_prob = log_B[:, w_j]
+            else:
+                # For BOS_WORD and EOS_WORD, emission probability is 1 (log(1) = 0)
+                emit_prob = torch.zeros(k)
+            # Compute the scores matrix by adding alpha[j - 1] to each column of log_A
+            # This uses broadcasting
+            scores = alpha[j - 1].unsqueeze(1) + log_A
+            # For each t_j, find the max score over t_prev and the corresponding backpointer
+            alpha_j, backpointer_j = torch.max(scores, dim=0)
+
+            # Add emission probabilities
+            alpha[j] = alpha_j + emit_prob
+            # Save backpointers
+            backpointers[j] = backpointer_j
+        # Backtracking
+        tags = [0] * len(isent)
+        tags[-1] = self.eos_t  # Start from EOS_TAG
+
+        for j in range(len(isent) - 1, 0, -1):
+            tags[j - 1] = backpointers[j][tags[j]]
+
+        # Construct the tagged sentence
+        tagged_sentence = Sentence()
+        for j in range(len(sentence)):
+            word = sentence[j][0]
+            tag_index = tags[j]
+            tag = self.tagset[tag_index]
+            tagged_sentence.append((word, tag))
+
+        return tagged_sentence
 
     def save(self, model_path: Path) -> None:
         logger.info(f"Saving model to {model_path}")
