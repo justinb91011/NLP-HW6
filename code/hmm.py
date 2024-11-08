@@ -143,7 +143,8 @@ class HiddenMarkovModel:
         The `λ` parameter will be used for add-λ smoothing.
         We respect structural zeroes ("don't guess when you know")."""
 
-           # Assert that there are no emissions from EOS or BOS tags
+
+        # Assert that there are no emissions from EOS or BOS tags
         assert self.B_counts[self.eos_t:self.bos_t, :].any() == 0, (
             "Your expected emission counts from EOS and BOS are not all zero, "
             "meaning you've accumulated them incorrectly!"
@@ -343,39 +344,27 @@ class HiddenMarkovModel:
         # preallocate a list alpha of length n+2 so that we can assign 
         # directly to each alpha[j] in turn.
         # Number of words in the sentence (excluding BOS and EOS)
-        n = len(isent) - 1
-        
-        # Preallocate alpha for each position; alpha[0] corresponds to BOS
-        alpha = [torch.full((self.k,), float('-inf')) for _ in range(n + 2)]
-        alpha[0][self.bos_t] = 0.0  # Start with log-prob 0 at BOS (log(1) = 0)
 
-        # Transition and emission matrices in log-space to prevent underflow
-        log_A = torch.log(self.A)
-        log_B = torch.log(self.B)
-        
-        # Forward algorithm to compute alpha values
+        n = len(isent) - 1
+        alpha = [torch.full((self.k,), float('-inf')) for _ in range(n + 2)]
+        alpha[0][self.bos_t] = 0.0  # log(1) = 0 at BOS
+
+        log_A = torch.log(self.A + 1e-10)  # small constant to prevent log(0)
+        log_B = torch.log(self.B + 1e-10)
+
         for j in range(1, n + 2):
             if j < n + 1:
-                w_j = isent[j][0]  # Current word index
-                if w_j < self.V:  # Only proceed if w_j is within bounds for log_B
-                    emit_probs = log_B[:, w_j]  # Emission probabilities for word w_j
-                else:
-                    emit_probs = torch.zeros(self.k)  # Set to zero if it's BOS or EOS
+                w_j = isent[j][0]
+                emit_probs = log_B[:, w_j] if w_j < self.V else torch.zeros(self.k)
             else:
-                # For EOS, there is no word emission; treat emission probability as 0 (log(1) = 0)
-                emit_probs = torch.zeros(self.k)
-            
-            # For each current tag t, compute alpha[t] by summing over all previous tags
+                emit_probs = torch.zeros(self.k)  # EOS, no emission
+
             for t in range(self.k):
                 alpha_prev = alpha[j - 1] + log_A[:, t]  # Transition from all tags to t
-                alpha[j][t] = torch.logsumexp(alpha_prev + emit_probs[t], dim=0)
+                alpha[j][t] = torch.logsumexp(alpha_prev, dim=0) + emit_probs[t]
 
-        # Log-probability of the entire sentence is in the EOS tag position at the end
-        log_Z = alpha[-1][self.eos_t]  # log Z = log probability of observing the sentence
-        
-        # Store alpha values for potential backward pass
-        self.alpha = alpha
-
+        log_Z = alpha[-1][self.eos_t]
+        self.alpha = alpha  # for potential backward pass
         return log_Z
             # Note: once you have this working on the ice cream data, you may
             # have to modify this design slightly to avoid underflow on the
