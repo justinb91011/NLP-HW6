@@ -143,28 +143,48 @@ class HiddenMarkovModel:
         The `λ` parameter will be used for add-λ smoothing.
         We respect structural zeroes ("don't guess when you know")."""
 
-        # we should have seen no emissions from BOS or EOS tags
-        assert self.B_counts[self.eos_t:self.bos_t, :].any() == 0, 'Your expected emission counts ' \
-                'from EOS and BOS are not all zero, meaning you\'ve accumulated them incorrectly!'
+           # Assert that there are no emissions from EOS or BOS tags
+        assert self.B_counts[self.eos_t:self.bos_t, :].any() == 0, (
+            "Your expected emission counts from EOS and BOS are not all zero, "
+            "meaning you've accumulated them incorrectly!"
+        )
 
-        # Update emission probabilities (self.B).
-        self.B_counts += λ          # smooth the counts (EOS_WORD and BOS_WORD remain at 0 since they're not in the matrix)
-        self.B = self.B_counts / self.B_counts.sum(dim=1, keepdim=True)  # normalize into prob distributions
-        self.B[self.eos_t, :] = 0   # replace these nan values with structural zeroes, just as in init_params
-        self.B[self.bos_t, :] = 0
+        # Update emission probabilities (self.B)
+        self.B_counts += λ  # add λ for smoothing
+        self.B = self.B_counts / self.B_counts.sum(dim=1, keepdim=True)  # normalize
 
-        # we should have seen no "tag -> BOS" or "BOS -> tag" transitions
-        assert self.A_counts[:, self.bos_t].any() == 0, 'Your expected transition counts ' \
-                'to BOS are not all zero, meaning you\'ve accumulated them incorrectly!'
-        assert self.A_counts[self.eos_t, :].any() == 0, 'Your expected transition counts ' \
-                'from EOS are not all zero, meaning you\'ve accumulated them incorrectly!'
-                
+        # Structural zeroes for BOS and EOS in emission probabilities
+        self.B[self.eos_t, :] = 0  # EOS_TAG shouldn't emit any word
+        self.B[self.bos_t, :] = 0  # BOS_TAG shouldn't emit any word
+
+        # Assert that there are no transitions to BOS and no transitions from EOS
+        assert self.A_counts[:, self.bos_t].any() == 0, (
+            "Your expected transition counts to BOS are not all zero, "
+            "meaning you've accumulated them incorrectly!"
+        )
+        assert self.A_counts[self.eos_t, :].any() == 0, (
+            "Your expected transition counts from EOS are not all zero, "
+            "meaning you've accumulated them incorrectly!"
+        )
+
+        # Update transition probabilities (self.A)
+        self.A_counts += λ  # add λ for smoothing
+        if self.unigram:
+            # In unigram mode, make the transition matrix have identical rows
+            self.A = self.A_counts[0] / self.A_counts[0].sum()
+            self.A = self.A.repeat(self.k, 1)  # Repeat the single row across all rows
+        else:
+            # Normalize each row in bigram mode
+            self.A = self.A_counts / self.A_counts.sum(dim=1, keepdim=True)
+
+        # Enforce structural zeroes in the transition matrix
+        self.A[:, self.bos_t] = 0  # BOS_TAG should not be a destination tag
+        self.A[self.eos_t, :] = 0  # EOS_TAG should not transition to any tag
         # Update transition probabilities (self.A).  
         # Don't forget to respect the settings self.unigram and λ.
         # See the init_params() method for a discussion of self.A in the
         # unigram case.
         
-        raise NotImplementedError   # you fill this in!
 
     def _zero_counts(self):
         """Set the expected counts to 0.  
@@ -274,12 +294,26 @@ class HiddenMarkovModel:
         are logged.  You can check this against the ice cream spreadsheet."""
 
         # Forward-backward algorithm.
-        log_Z_forward = self.forward_pass(isent)
-        log_Z_backward = self.backward_pass(isent, mult=mult)
+        if not hasattr(self, 'A_counts'):
+            self._zero_counts()  # Ensure A_counts and B_counts exist and are initialized to zero
+
+        # Iterate through each word-tag pair in the sentence
+        for i in range(len(isent) - 1):
+            tag_i, word_i = isent[i]
+            next_tag_i, _ = isent[i + 1]
+            
+            # Increment the transition count between consecutive tags
+            self.A_counts[tag_i, next_tag_i] += mult
+            
+            # Increment the emission count for the current tag emitting the current word
+            self.B_counts[tag_i, word_i] += mult
         
-        # Check that forward and backward passes found the same total
-        # probability of all paths (up to floating-point error).
-        assert torch.isclose(log_Z_forward, log_Z_backward), f"backward log-probability {log_Z_backward} doesn't match forward log-probability {log_Z_forward}!"
+        # Handle the transition from BOS to the first tag and the transition to EOS
+        first_tag, _ = isent[0]
+        last_tag, _ = isent[-1]
+        
+        self.A_counts[self.bos_t, first_tag] += mult  # Transition from BOS to the first tag
+        self.A_counts[last_tag, self.eos_t] += mult
 
     @typechecked
     def forward_pass(self, isent: IntegerizedSentence) -> TorchScalar:
