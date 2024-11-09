@@ -142,45 +142,32 @@ class HiddenMarkovModel:
         counts (A_counts, B_counts) that were accumulated by the E step.
         The `λ` parameter will be used for add-λ smoothing.
         We respect structural zeroes ("don't guess when you know")."""
-
-
-        # Assert that there are no emissions from EOS or BOS tags
-        assert self.B_counts[self.eos_t:self.bos_t, :].any() == 0, (
-            "Your expected emission counts from EOS and BOS are not all zero, "
-            "meaning you've accumulated them incorrectly!"
-        )
-
         # Update emission probabilities (self.B)
-        self.B_counts += λ  # add λ for smoothing
-        self.B = self.B_counts / self.B_counts.sum(dim=1, keepdim=True)  # normalize
+        numerator_B = self.B_counts + λ
+        numerator_B[self.eos_t, :] = 0
+        numerator_B[self.bos_t, :] = 0
+        denominator_B = numerator_B.sum(dim=1, keepdim=True)  # Sum over words for each tag
+        denominator_B[denominator_B == 0] = 1
+        self.B = numerator_B / denominator_B
+        self.B[self.eos_t, :] = 0    # Enforce structural zeros
+        self.B[self.bos_t, :] = 0
 
-        # Structural zeroes for BOS and EOS in emission probabilities
-        self.B[self.eos_t, :] = 0  # EOS_TAG shouldn't emit any word
-        self.B[self.bos_t, :] = 0  # BOS_TAG shouldn't emit any word
-
-        # Assert that there are no transitions to BOS and no transitions from EOS
-        assert self.A_counts[:, self.bos_t].any() == 0, (
-            "Your expected transition counts to BOS are not all zero, "
-            "meaning you've accumulated them incorrectly!"
-        )
-        assert self.A_counts[self.eos_t, :].any() == 0, (
-            "Your expected transition counts from EOS are not all zero, "
-            "meaning you've accumulated them incorrectly!"
-        )
-
-        # Update transition probabilities (self.A)
-        self.A_counts += λ  # add λ for smoothing
         if self.unigram:
-            # In unigram mode, make the transition matrix have identical rows
-            self.A = self.A_counts[0] / self.A_counts[0].sum()
-            self.A = self.A.repeat(self.k, 1)  # Repeat the single row across all rows
+            total_counts_t = self.A_counts.sum(dim=0)
+            numerator_A = total_counts_t + λ
+            numerator_A[self.bos_t] = 0 
+            denominator_A = numerator_A.sum()
+            if denominator_A == 0:
+                denominator_A = 1
+            p_t = numerator_A / denominator_A
+            self.A = p_t.unsqueeze(0).repeat(self.k, 1)
         else:
-            # Normalize each row in bigram mode
-            self.A = self.A_counts / self.A_counts.sum(dim=1, keepdim=True)
-
-        # Enforce structural zeroes in the transition matrix
-        self.A[:, self.bos_t] = 0  # BOS_TAG should not be a destination tag
-        self.A[self.eos_t, :] = 0  # EOS_TAG should not transition to any tag
+            numerator_A = self.A_counts + λ
+            numerator_A[:, self.bos_t] = 0
+            denominator_A = numerator_A.sum(dim=1, keepdim=True)
+            denominator_A[denominator_A == 0] = 1
+            self.A = numerator_A / denominator_A
+            self.A[:, self.bos_t] = 0
         # Update transition probabilities (self.A).  
         # Don't forget to respect the settings self.unigram and λ.
         # See the init_params() method for a discussion of self.A in the
@@ -293,39 +280,31 @@ class HiddenMarkovModel:
         
         When the logging level is set to DEBUG, the alpha and beta vectors and posterior counts
         are logged.  You can check this against the ice cream spreadsheet."""
+        for j in range(1, len(isent)):
+            t_prev = isent[j - 1][1]
+            t_j = isent[j][1]
+            w_j = isent[j][0]
 
-        # Forward-backward algorithm.
-        if not hasattr(self, 'A_counts'):
-            self._zero_counts()  # Ensure A_counts and B_counts exist and are initialized to zero
+            # Ensure that tags are known (not None)
+            if t_prev is not None and t_j is not None:
+                # Accumulate transition counts
+                self.A_counts[t_prev, t_j] += mult
 
-        # Iterate through each word-tag pair in the sentence
-        for i in range(len(isent) - 1):
-            tag_i, word_i = isent[i]
-            next_tag_i, _ = isent[i + 1]
+                if w_j < self.V:
+                    self.B_counts[t_j, w_j] += mult
+                else:
+                    # Handle special words (BOS_WORD and EOS_WORD)
+                    if w_j == self.vocab.index(BOS_WORD):
+                        pass
+                    elif w_j == self.vocab.index(EOS_WORD):
+                        pass
+                    else:
+                        raise ValueError("Unknown word index")
+            else:
+                raise ValueError("Encountered an unknown tag in supervised training.")
             
-            # Ensure none of the indices are None before proceeding
-            if tag_i is None or word_i is None or next_tag_i is None:
-                continue
-
-            # Increment the transition count between consecutive tags, excluding transitions to BOS_TAG and from EOS_TAG
-            if tag_i < self.k and next_tag_i < self.k and next_tag_i != self.bos_t and tag_i != self.eos_t:
-                self.A_counts[tag_i, next_tag_i] += mult
             
-            # Increment the emission count for the current tag emitting the current word
-            if tag_i < self.k and word_i < self.V and tag_i != self.eos_t and tag_i != self.bos_t:
-                # Only count emissions for non-EOS and non-BOS tags
-                self.B_counts[tag_i, word_i] += mult
-
-        # Handle the transition from BOS to the first tag and the transition to EOS
-        first_tag, _ = isent[0]
-        last_tag, _ = isent[-1]
-
-        # Ensure first_tag and last_tag are not None before updating counts
-        if self.bos_t is not None and first_tag is not None and first_tag < self.k:
-            self.A_counts[self.bos_t, first_tag] += mult  # Transition from BOS to the first tag
-        if last_tag is not None and self.eos_t is not None and last_tag < self.k:
-            self.A_counts[last_tag, self.eos_t] += mult  # Transition from the last tag to EOS
-        
+            
 
     @typechecked
     def forward_pass(self, isent: IntegerizedSentence) -> TorchScalar:
@@ -344,28 +323,54 @@ class HiddenMarkovModel:
         # preallocate a list alpha of length n+2 so that we can assign 
         # directly to each alpha[j] in turn.
         # Number of words in the sentence (excluding BOS and EOS)
+        n = len(isent) - 2  # Number of words excluding BOS and EOS
+        k = self.k
 
-        n = len(isent) - 1
-        alpha = [torch.full((self.k,), float('-inf')) for _ in range(n + 2)]
-        alpha[0][self.bos_t] = 0.0  # log(1) = 0 at BOS
+        # Precompute log probabilities to prevent underflow
+        log_pA = torch.log(self.A + 1e-10)
+        log_pB = torch.log(self.B + 1e-10)
+        log_alpha = [torch.full((k,), float('-inf')) for _ in isent]
+        log_alpha[0][self.bos_t] = 0.0  # log(1.0) = 0.0
 
-        log_A = torch.log(self.A + 1e-10)  # small constant to prevent log(0)
-        log_B = torch.log(self.B + 1e-10)
-
-        for j in range(1, n + 2):
-            if j < n + 1:
-                w_j = isent[j][0]
-                emit_probs = log_B[:, w_j] if w_j < self.V else torch.zeros(self.k)
+        tau = []
+        for j in range(len(isent)):
+            if isent[j][1] is None:
+                tau_j = range(k)
             else:
-                emit_probs = torch.zeros(self.k)  # EOS, no emission
+                tau_j = [isent[j][1]]
+            tau.append(tau_j)
 
-            for t in range(self.k):
-                alpha_prev = alpha[j - 1] + log_A[:, t]  # Transition from all tags to t
-                alpha[j][t] = torch.logsumexp(alpha_prev, dim=0) + emit_probs[t]
+        for j in range(1, len(isent)):
+            w_j = isent[j][0]
+            if w_j < self.V:
+                log_pB_wj = log_pB[:, w_j]
+            else:
+                # Handle special words
+                log_pB_wj = torch.full((k,), float('-inf'))
+                if w_j == self.vocab.index(BOS_WORD):
+                    log_pB_wj[self.bos_t] = 0.0  # log(1.0)
+                elif w_j == self.vocab.index(EOS_WORD):
+                    log_pB_wj[self.eos_t] = 0.0  # log(1.0)
+                else:
+                    raise ValueError("Unknown word index")
 
-        log_Z = alpha[-1][self.eos_t]
-        self.alpha = alpha  # for potential backward pass
+            for t_j in tau[j]:
+                # Compute log_alpha[j][t_j] using log-sum-exp
+                log_alpha_j_tj = torch.tensor(float('-inf'))
+                for t_prev in tau[j - 1]:
+                    log_alpha_prev = log_alpha[j - 1][t_prev]
+                    log_trans_prob = log_pA[t_prev, t_j]
+                    log_e_prob = log_pB_wj[t_j]
+                    log_sum = log_alpha_prev + log_trans_prob + log_e_prob
+                    log_alpha_j_tj = torch.logaddexp(log_alpha_j_tj, log_sum)
+                log_alpha[j][t_j] = log_alpha_j_tj
+
+        log_Z = log_alpha[-1][self.eos_t]
+        self.log_alpha = log_alpha
+        self.log_Z = log_Z
+
         return log_Z
+        
             # Note: once you have this working on the ice cream data, you may
             # have to modify this design slightly to avoid underflow on the
             # English tagging data. See section C in the reading handout.
