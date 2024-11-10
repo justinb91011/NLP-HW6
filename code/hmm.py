@@ -143,31 +143,30 @@ class HiddenMarkovModel:
         The `λ` parameter will be used for add-λ smoothing.
         We respect structural zeroes ("don't guess when you know")."""
         # Update emission probabilities (self.B)
+        ε = 1e-15  # Add a small epsilon for stability
+
+        # Emission matrix B
         numerator_B = self.B_counts + λ
         numerator_B[self.eos_t, :] = 0
         numerator_B[self.bos_t, :] = 0
-        denominator_B = numerator_B.sum(dim=1, keepdim=True)  # Sum over words for each tag
-        denominator_B[denominator_B == 0] = 1
+        denominator_B = numerator_B.sum(dim=1, keepdim=True) + ε
         self.B = numerator_B / denominator_B
-        self.B[self.eos_t, :] = 0    # Enforce structural zeros
         self.B[self.bos_t, :] = 0
+        self.B[self.eos_t, :] = 0
 
+        # Transition matrix A
         if self.unigram:
-            total_counts_t = self.A_counts.sum(dim=0)
-            numerator_A = total_counts_t + λ
-            numerator_A[self.bos_t] = 0 
-            denominator_A = numerator_A.sum()
-            if denominator_A == 0:
-                denominator_A = 1
-            p_t = numerator_A / denominator_A
+            total_counts_t = self.A_counts.sum(dim=0) + λ
+            total_counts_t[self.bos_t] = 0
+            denominator_A = total_counts_t.sum() + ε
+            p_t = total_counts_t / denominator_A
             self.A = p_t.unsqueeze(0).repeat(self.k, 1)
         else:
             numerator_A = self.A_counts + λ
             numerator_A[:, self.bos_t] = 0
-            denominator_A = numerator_A.sum(dim=1, keepdim=True)
-            denominator_A[denominator_A == 0] = 1
+            denominator_A = numerator_A.sum(dim=1, keepdim=True) + ε
             self.A = numerator_A / denominator_A
-            self.A[:, self.bos_t] = 0
+            self.A[:, self.bos_t] = 0  
         # Update transition probabilities (self.A).  
         # Don't forget to respect the settings self.unigram and λ.
         # See the init_params() method for a discussion of self.A in the
@@ -280,12 +279,27 @@ class HiddenMarkovModel:
         
         When the logging level is set to DEBUG, the alpha and beta vectors and posterior counts
         are logged.  You can check this against the ice cream spreadsheet."""
-        
         log_Z_forward = self.forward_pass(isent)
-        log_Z_backward = self.backward_pass(isent, mult = mult)
+        log_Z_backward = self.backward_pass(isent, mult=mult)
 
-        assert torch.isclose(log_Z_forward, log_Z_backward), f"backward log-probability {log_Z_backward} doesn't match forward log-probability {log_Z_forward}!"
-            
+        # Ensure forward and backward results match within a tolerance
+        if not torch.isclose(log_Z_forward, log_Z_backward, atol=1e-6):
+            raise ValueError(f"Backward log-probability {log_Z_backward} does not match forward log-probability {log_Z_forward}!")
+
+        # Accumulate exact counts for observed tags and words in a supervised manner
+        for j in range(1, len(isent)):
+            w_j = isent[j][0]         # Word index at position j
+            t_j = isent[j][1]         # Tag index at position j
+            t_prev = isent[j - 1][1] if isent[j - 1][1] is not None else self.bos_t
+
+            # Update transition counts for the observed transition (t_prev -> t_j)
+            self.A_counts[t_prev, t_j] += mult
+
+            # Update emission counts for observed emissions of standard words
+            if w_j < self.V:
+                self.B_counts[t_j, w_j] += mult
+
+
             
 
     @typechecked
@@ -305,14 +319,14 @@ class HiddenMarkovModel:
         # preallocate a list alpha of length n+2 so that we can assign 
         # directly to each alpha[j] in turn.
         # Number of words in the sentence (excluding BOS and EOS)
-        n = len(isent) - 2  # Number of words excluding BOS and EOS
+        n = len(isent) - 2 # Number of words excluding BOS and EOS
         k = self.k
 
-        # Precompute log probabilities to prevent underflow
+
         log_pA = torch.log(self.A + 1e-10)
         log_pB = torch.log(self.B + 1e-10)
         log_alpha = [torch.full((k,), float('-inf')) for _ in isent]
-        log_alpha[0][self.bos_t] = 0.0  # log(1.0) = 0.0
+        log_alpha[0][self.bos_t] = 0.0
 
         tau = []
         for j in range(len(isent)):
@@ -330,14 +344,13 @@ class HiddenMarkovModel:
                 # Handle special words
                 log_pB_wj = torch.full((k,), float('-inf'))
                 if w_j == self.vocab.index(BOS_WORD):
-                    log_pB_wj[self.bos_t] = 0.0  # log(1.0)
+                    log_pB_wj[self.bos_t] = 0.0
                 elif w_j == self.vocab.index(EOS_WORD):
-                    log_pB_wj[self.eos_t] = 0.0  # log(1.0)
+                    log_pB_wj[self.eos_t] = 0.0
                 else:
                     raise ValueError("Unknown word index")
 
             for t_j in tau[j]:
-                # Compute log_alpha[j][t_j] using log-sum-exp
                 log_alpha_j_tj = torch.tensor(float('-inf'))
                 for t_prev in tau[j - 1]:
                     log_alpha_prev = log_alpha[j - 1][t_prev]
