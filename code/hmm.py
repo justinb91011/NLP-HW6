@@ -280,29 +280,11 @@ class HiddenMarkovModel:
         
         When the logging level is set to DEBUG, the alpha and beta vectors and posterior counts
         are logged.  You can check this against the ice cream spreadsheet."""
-        for j in range(1, len(isent)):
-            t_prev = isent[j - 1][1]
-            t_j = isent[j][1]
-            w_j = isent[j][0]
+        
+        log_Z_forward = self.forward_pass(isent)
+        log_Z_backward = self.backward_pass(isent, mult = mult)
 
-            # Ensure that tags are known (not None)
-            if t_prev is not None and t_j is not None:
-                # Accumulate transition counts
-                self.A_counts[t_prev, t_j] += mult
-
-                if w_j < self.V:
-                    self.B_counts[t_j, w_j] += mult
-                else:
-                    # Handle special words (BOS_WORD and EOS_WORD)
-                    if w_j == self.vocab.index(BOS_WORD):
-                        pass
-                    elif w_j == self.vocab.index(EOS_WORD):
-                        pass
-                    else:
-                        raise ValueError("Unknown word index")
-            else:
-                raise ValueError("Encountered an unknown tag in supervised training.")
-            
+        assert torch.isclose(log_Z_forward, log_Z_backward), f"backward log-probability {log_Z_backward} doesn't match forward log-probability {log_Z_forward}!"
             
             
 
@@ -387,13 +369,58 @@ class HiddenMarkovModel:
         values and log Z, which were stored for us (in self) by the forward
         pass."""
 
-        # Pre-allocate beta just as we pre-allocated alpha.
-        beta = [torch.empty(self.k) for _ in isent]
-        beta[-1] = self.eye[self.eos_t]  # vector that is one-hot at EOS_TAG
-       
-        raise NotImplementedError   # you fill this in!
+        n = len(isent) - 2
+        k = self.k
 
-        return log_Z_backward
+        # Precompute log probabilities to prevent underflow
+        log_pA = torch.log(self.A + 1e-10)
+        log_pB = torch.log(self.B + 1e-10)
+
+        # Initialize beta (backward probabilities)
+        beta = [torch.full((k,), float('-inf')) for _ in isent]
+        beta[-1][self.eos_t] = 0.0  
+       
+        tau = []
+        for j in range(len(isent)):
+            if isent[j][1] is None:
+                tau_j = range(k)
+            else:
+                tau_j = [isent[j][1]]
+            tau.append(tau_j)
+        
+        # Backward pass: compute beta values
+        for j in range(len(isent) - 2, -1, -1):
+            w_jp1 = isent[j + 1][0]
+            for t in tau[j]:
+                beta_t = torch.tensor(float('-inf'))
+                for t_next in tau[j + 1]:
+                    log_trans_prob = log_pA[t, t_next]
+                    if w_jp1 < self.V:
+                        log_emiss_prob = log_pB[t_next, w_jp1]
+                    else:
+                        log_emiss_prob = 0.0 if w_jp1 == self.vocab.index(EOS_WORD) else float('-inf')
+                    beta_t = torch.logaddexp(beta_t, beta[j + 1][t_next] + log_trans_prob + log_emiss_prob)
+                beta[j][t] = beta_t   
+
+        # Accumulate expected counts using alpha and beta
+        log_Z = beta[0][self.bos_t]  # log Z from backward pass
+        for j in range(1, len(isent)):
+            w_j = isent[j][0]
+            for t_prev in tau[j - 1]:
+                for t_curr in tau[j]:
+                    # Compute expected transition count
+                    trans_prob = torch.exp(self.log_alpha[j - 1][t_prev] +
+                                       log_pA[t_prev, t_curr] +
+                                       beta[j][t_curr] - self.log_Z)
+                    self.A_counts[t_prev, t_curr] += trans_prob * mult
+
+                    # Compute expected emission count
+                    if w_j < self.V:
+                        emiss_prob = torch.exp(self.log_alpha[j][t_curr] +
+                                           beta[j][t_curr] -
+                                           self.log_Z)
+                        self.B_counts[t_curr, w_j] += emiss_prob * mult           
+        return log_Z
 
     def viterbi_tagging(self, sentence: Sentence, corpus: TaggedCorpus) -> Sentence:
         """Find the most probable tagging for the given sentence, according to the
