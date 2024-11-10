@@ -286,22 +286,6 @@ class HiddenMarkovModel:
         if not torch.isclose(log_Z_forward, log_Z_backward, atol=1e-6):
             raise ValueError(f"Backward log-probability {log_Z_backward} does not match forward log-probability {log_Z_forward}!")
 
-        # Accumulate exact counts for observed tags and words in a supervised manner
-        for j in range(1, len(isent)):
-            w_j = isent[j][0]         # Word index at position j
-            t_j = isent[j][1]         # Tag index at position j
-            t_prev = isent[j - 1][1] if isent[j - 1][1] is not None else self.bos_t
-
-            # Update transition counts for the observed transition (t_prev -> t_j)
-            self.A_counts[t_prev, t_j] += mult
-
-            # Update emission counts for observed emissions of standard words
-            if w_j < self.V:
-                self.B_counts[t_j, w_j] += mult
-
-
-            
-
     @typechecked
     def forward_pass(self, isent: IntegerizedSentence) -> TorchScalar:
         """Run the forward algorithm from the handout on a tagged, untagged, 
@@ -313,29 +297,24 @@ class HiddenMarkovModel:
         (store some representation of them into attributes of self)
         so that they can subsequently be used by the backward pass."""
         
-        # The "nice" way to construct the sequence of vectors alpha[0],
-        # alpha[1], ...  is by appending to a List[Tensor] at each step.
-        # But to better match the notation in the handout, we'll instead
-        # preallocate a list alpha of length n+2 so that we can assign 
-        # directly to each alpha[j] in turn.
-        # Number of words in the sentence (excluding BOS and EOS)
         n = len(isent) - 2 # Number of words excluding BOS and EOS
         k = self.k
-
 
         log_pA = torch.log(self.A + 1e-10)
         log_pB = torch.log(self.B + 1e-10)
         log_alpha = [torch.full((k,), float('-inf')) for _ in isent]
         log_alpha[0][self.bos_t] = 0.0
 
+
         tau = []
         for j in range(len(isent)):
-            if isent[j][1] is None:
+            if isent[j][1] is None: # If tag is unknown(None), the position is untagged 
                 tau_j = range(k)
             else:
-                tau_j = [isent[j][1]]
-            tau.append(tau_j)
+                tau_j = [isent[j][1]] # Restrict to the single known tag for this position
+            tau.append(tau_j) # Append the valid tags for this position to the tau list
 
+        # Accumulate counts
         for j in range(1, len(isent)):
             w_j = isent[j][0]
             if w_j < self.V:
@@ -347,8 +326,6 @@ class HiddenMarkovModel:
                     log_pB_wj[self.bos_t] = 0.0
                 elif w_j == self.vocab.index(EOS_WORD):
                     log_pB_wj[self.eos_t] = 0.0
-                else:
-                    raise ValueError("Unknown word index")
 
             for t_j in tau[j]:
                 log_alpha_j_tj = torch.tensor(float('-inf'))
@@ -365,10 +342,6 @@ class HiddenMarkovModel:
         self.log_Z = log_Z
 
         return log_Z
-        
-            # Note: once you have this working on the ice cream data, you may
-            # have to modify this design slightly to avoid underflow on the
-            # English tagging data. See section C in the reading handout.
 
 
     @typechecked
@@ -385,54 +358,45 @@ class HiddenMarkovModel:
         n = len(isent) - 2
         k = self.k
 
-        # Precompute log probabilities to prevent underflow
+        # Precompute log probabilities
         log_pA = torch.log(self.A + 1e-10)
         log_pB = torch.log(self.B + 1e-10)
 
-        # Initialize beta (backward probabilities)
+        # Initialize beta values
         beta = [torch.full((k,), float('-inf')) for _ in isent]
-        beta[-1][self.eos_t] = 0.0  
-       
+        beta[-1][self.eos_t] = 0.0  # Log(1.0) for EOS
+
         tau = []
         for j in range(len(isent)):
-            if isent[j][1] is None:
+            if isent[j][1] is None: # If tag is unknown(None), the position is untagged
                 tau_j = range(k)
             else:
-                tau_j = [isent[j][1]]
-            tau.append(tau_j)
-        
-        # Backward pass: compute beta values
+                tau_j = [isent[j][1]] # Restrict to the single known tag for this position
+            tau.append(tau_j) # Append the valid tags for this position to the tau list
+
+        # Accumulate counts
         for j in range(len(isent) - 2, -1, -1):
             w_jp1 = isent[j + 1][0]
-            for t in tau[j]:
-                beta_t = torch.tensor(float('-inf'))
-                for t_next in tau[j + 1]:
-                    log_trans_prob = log_pA[t, t_next]
+            for t_curr in tau[j + 1]:
+                for t_prev in tau[j]:
+                    # Transition probability
+                    log_trans_prob = log_pA[t_prev, t_curr]
+                    # Emission probability
+                    log_emiss_prob = log_pB[t_curr, w_jp1] if w_jp1 < self.V else float('-inf')
+                    if w_jp1 == self.vocab.index(EOS_WORD):
+                        log_emiss_prob = 0.0
+
+                    # Beta update
+                    beta_t = beta[j + 1][t_curr] + log_trans_prob + log_emiss_prob
+                    beta[j][t_prev] = torch.logaddexp(beta[j][t_prev], beta_t)
+
+                    # Increment counts
+                    prob = torch.exp(self.log_alpha[j][t_prev] + beta_t - self.log_Z)
+                    self.A_counts[t_prev, t_curr] += prob * mult
                     if w_jp1 < self.V:
-                        log_emiss_prob = log_pB[t_next, w_jp1]
-                    else:
-                        log_emiss_prob = 0.0 if w_jp1 == self.vocab.index(EOS_WORD) else float('-inf')
-                    beta_t = torch.logaddexp(beta_t, beta[j + 1][t_next] + log_trans_prob + log_emiss_prob)
-                beta[j][t] = beta_t   
+                        self.B_counts[t_curr, w_jp1] += prob * mult
 
-        # Accumulate expected counts using alpha and beta
-        log_Z = beta[0][self.bos_t]  # log Z from backward pass
-        for j in range(1, len(isent)):
-            w_j = isent[j][0]
-            for t_prev in tau[j - 1]:
-                for t_curr in tau[j]:
-                    # Compute expected transition count
-                    trans_prob = torch.exp(self.log_alpha[j - 1][t_prev] +
-                                       log_pA[t_prev, t_curr] +
-                                       beta[j][t_curr] - self.log_Z)
-                    self.A_counts[t_prev, t_curr] += trans_prob * mult
-
-                    # Compute expected emission count
-                    if w_j < self.V:
-                        emiss_prob = torch.exp(self.log_alpha[j][t_curr] +
-                                           beta[j][t_curr] -
-                                           self.log_Z)
-                        self.B_counts[t_curr, w_j] += emiss_prob * mult           
+        log_Z = beta[0][self.bos_t]
         return log_Z
 
     def viterbi_tagging(self, sentence: Sentence, corpus: TaggedCorpus) -> Sentence:
