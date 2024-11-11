@@ -459,8 +459,8 @@ class HiddenMarkovModel:
         backpointers = [torch.zeros(k, dtype=torch.long) for _ in isent]
 
         # Log probabilities to prevent underflow
-        log_A = torch.log(self.A)
-        log_B = torch.log(self.B)
+        log_A = torch.log(self.A + 1e-10)
+        log_B = torch.log(self.B + 1e-10)
 
          # Initialization at position 0 (BOS)
         alpha[0][self.bos_t] = 0.0
