@@ -11,7 +11,7 @@ import torch
 from eval import model_cross_entropy, viterbi_error_rate, write_tagging
 from hmm import HiddenMarkovModel
 from crf import ConditionalRandomField
-from lexicon import build_lexicon
+# from lexicon import build_lexicon
 from corpus import TaggedCorpus
 
 def parse_args() -> argparse.Namespace:
