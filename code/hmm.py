@@ -288,7 +288,14 @@ class HiddenMarkovModel:
 
     @typechecked
     def forward_pass(self, isent: IntegerizedSentence) -> TorchScalar:
-        """Optimized forward algorithm using tensor operations."""
+        """Run the forward algorithm from the handout on a tagged, untagged, 
+        or partially tagged sentence.  Return log Z (the log of the forward
+        probability) as a TorchScalar.  If the sentence is not fully tagged, the 
+        forward probability will marginalize over all possible tags.  
+        
+        As a side effect, remember the alpha probabilities and log_Z
+        (store some representation of them into attributes of self)
+        so that they can subsequently be used by the backward pass."""
     
         n = len(isent)  # Total positions including BOS and EOS
         k = self.k
@@ -325,15 +332,15 @@ class HiddenMarkovModel:
         # Apply tau mask to emission probabilities
         log_pB_wj[~tau_mask] = float('-inf')
 
-        # Forward recursion
+        # Forward 
         for j in range(1, n):
             # Compute scores
-            prev_alpha = log_alpha[j - 1].unsqueeze(1)  # Shape (k_prev, 1)
-            scores = prev_alpha + log_pA  # Shape (k_prev, k_curr)
-            scores += log_pB_wj[j].unsqueeze(0)  # Shape (1, k_curr)
+            prev_alpha = log_alpha[j - 1].unsqueeze(1)  
+            scores = prev_alpha + log_pA  
+            scores += log_pB_wj[j].unsqueeze(0)  
 
             # Create mask for valid transitions
-            mask = tau_mask[j - 1].unsqueeze(1) & tau_mask[j].unsqueeze(0)  # Shape (k_prev, k_curr)
+            mask = tau_mask[j - 1].unsqueeze(1) & tau_mask[j].unsqueeze(0)  
 
             # Apply mask to scores
             scores[~mask] = float('-inf')
@@ -354,7 +361,14 @@ class HiddenMarkovModel:
 
     @typechecked
     def backward_pass(self, isent: IntegerizedSentence, mult: float = 1) -> TorchScalar:
-        """Optimized backward algorithm using tensor operations."""
+        """Run the backwards algorithm from the handout on a tagged, untagged, 
+        or partially tagged sentence.  Return log Z (the log of the backward
+        probability). 
+        
+        As a side effect, add the expected transition and emission counts (times
+        mult) into self.A_counts and self.B_counts.  These depend on the alpha
+        values and log Z, which were stored for us (in self) by the forward
+        pass."""
     
         n = len(isent)  # Total positions including BOS and EOS
         k = self.k
@@ -394,14 +408,14 @@ class HiddenMarkovModel:
         # Backward recursion
         for j in range(n - 2, -1, -1):
             # Next beta values
-            next_beta = log_beta[j + 1]  # Shape (k,)
+            next_beta = log_beta[j + 1]  
             next_beta[~tau_mask[j + 1]] = float('-inf')
 
             # Compute scores
-            scores = log_pA + log_pB_wj[j + 1].unsqueeze(0) + next_beta.unsqueeze(0)  # Shape (k_prev, k_curr)
+            scores = log_pA + log_pB_wj[j + 1].unsqueeze(0) + next_beta.unsqueeze(0)  
 
             # Create mask for valid transitions
-            mask = tau_mask[j].unsqueeze(1) & tau_mask[j + 1].unsqueeze(0)  # Shape (k_prev, k_curr)
+            mask = tau_mask[j].unsqueeze(1) & tau_mask[j + 1].unsqueeze(0) 
 
             # Apply mask to scores
             scores[~mask] = float('-inf')
@@ -413,15 +427,15 @@ class HiddenMarkovModel:
             log_beta[j][~tau_mask[j]] = float('-inf')
 
             # Compute posterior probabilities for transitions
-            alpha_j = self.log_alpha[j].unsqueeze(1)  # Shape (k_prev, 1)
-            beta_jp1 = log_beta[j + 1].unsqueeze(0)   # Shape (1, k_curr)
+            alpha_j = self.log_alpha[j].unsqueeze(1)  
+            beta_jp1 = log_beta[j + 1].unsqueeze(0)   
             xi_scores = alpha_j + log_pA + log_pB_wj[j + 1].unsqueeze(0) + beta_jp1 - self.log_Z
 
             # Apply the same mask to xi_scores
             xi_scores[~mask] = float('-inf')
 
             # Convert scores to probabilities
-            xi_probs = torch.exp(xi_scores)  # Shape (k_prev, k_curr)
+            xi_probs = torch.exp(xi_scores)  
 
             # Accumulate expected counts
             self.A_counts += xi_probs * mult
