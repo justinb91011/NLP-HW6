@@ -120,6 +120,10 @@ class HiddenMarkovModel:
             # although unfortunately that preserves the O(nk^2) runtime instead
             # of letting us speed up to O(nk) in the unigram case.
             self.A = self.A.repeat(self.k, 1)   # copy the single row k times  
+      
+        # Compute log-potentials
+        self.log_A = torch.log(self.A + 1e-10)
+        self.log_B = torch.log(self.B + 1e-10)
 
     def printAB(self) -> None:
         """Print the A and B matrices in a more human-readable format (tab-separated)."""
@@ -170,6 +174,8 @@ class HiddenMarkovModel:
         # Don't forget to respect the settings self.unigram and λ.
         # See the init_params() method for a discussion of self.A in the
         # unigram case.
+        self.log_A = torch.log(self.A + 1e-10)
+        self.log_B = torch.log(self.B + 1e-10)
         
 
     def _zero_counts(self):
@@ -300,8 +306,8 @@ class HiddenMarkovModel:
         k = self.k
 
         # Precompute log probabilities to prevent repeated computation
-        log_pA = torch.log(self.A + 1e-10)  # Transition probabilities (k x k)
-        log_pB = torch.log(self.B + 1e-10)  # Emission probabilities (k x V)
+        log_pA = self.log_A
+        log_pB = self.log_B
 
         # Initialize alpha tensor (n x k)
         log_alpha = torch.full((n, k), float('-inf'))
@@ -373,8 +379,8 @@ class HiddenMarkovModel:
         k = self.k
 
         # Precompute log probabilities
-        log_pA = torch.log(self.A + 1e-10)  # Transition probabilities (k x k)
-        log_pB = torch.log(self.B + 1e-10)  # Emission probabilities (k x V)
+        log_pA = self.log_A
+        log_pB = self.log_B
 
         # Initialize beta tensor (n x k)
         log_beta = torch.full((n, k), float('-inf'))

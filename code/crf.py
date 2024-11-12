@@ -22,7 +22,6 @@ from corpus import (BOS_TAG, BOS_WORD, EOS_TAG, EOS_WORD, Sentence, Tag,
                     TaggedCorpus, Word)
 from integerize import Integerizer
 from hmm import HiddenMarkovModel
-import torch.nn as nn
 
 TorchScalar = Float[Tensor, ""] # a Tensor with no dimensions, i.e., a scalar
 
@@ -46,52 +45,56 @@ class ConditionalRandomField(HiddenMarkovModel):
     
     @override
     def __init__(self, 
-             tagset: Integerizer[Tag],
-             vocab: Integerizer[Word],
-             unigram: bool = False):
-        """Construct a CRF with initially random parameters, with the
-        given tagset, vocabulary, and lexical features."""
-        
-        # Initialize WA and WB before calling super().__init__()
-        self.WA = torch.empty((1 if unigram else len(tagset), len(tagset)))
-        self.WB = torch.empty((len(tagset), len(vocab)))
-        
-        # Now call the parent constructor
+                 tagset: Integerizer[Tag],
+                 vocab: Integerizer[Word],
+                 unigram: bool = False):
+        """Construct an CRF with initially random parameters, with the
+        given tagset, vocabulary, and lexical features.  See the super()
+        method for discussion."""
+
         super().__init__(tagset, vocab, unigram)
 
-
-        self.init_params()
-        
     @override
     def init_params(self) -> None:
         """Initialize params self.WA and self.WB to small random values, and
         then compute the potential matrices A, B from them.
         As in the parent method, we respect structural zeroes ("Don't guess when you know")."""
 
-        # See the "Training CRFs" section of the reading handout.
-        # 
-        # For a unigram model, self.WA should just have a single row:
-        # that model has fewer parameters.
+        k = self.k
+        V = self.V
 
-        nn.init.normal_(self.WA, mean=0, std=0.01)
-        nn.init.normal_(self.WB, mean=0, std=0.01)
-        self.updateAB()  # compute potential matrices
+        # For a unigram model, self.WA should just have a single row
+        rows = 1 if self.unigram else k
+
+        # Initialize self.WA and self.WB to small random values
+        self.WA = 0.01 * torch.randn(rows, k)
+        self.WB = 0.01 * torch.randn(k, V)
+
+        
+        NEG_INF = 1e-10
+        self.WA[:, self.bos_t] = NEG_INF
+        self.WB[self.bos_t, :] = NEG_INF
+        self.WB[self.eos_t, :] = NEG_INF
+        self.updateAB()   # compute potential matrices
 
     def updateAB(self) -> None:
         """Set the transition and emission matrices self.A and self.B, 
         based on the current parameters self.WA and self.WB.
         See the "Parametrization" section of the reading handout."""
        
-        # Even when self.WA is just one row (for a unigram model), 
-        # you should make a full k × k matrix A of transition potentials,
-        # so that the forward-backward code will still work.
-        # See init_params() in the parent class for discussion of this point.
-        
         if self.unigram:
-            self.A = self.WA.expand(len(self.tagset), -1)
+            # For a unigram model, expand WA to a full matrix
+            A_potentials = torch.exp(self.WA).repeat(self.k, 1)
         else:
-            self.A = self.WA
-        self.B = self.WB
+            A_potentials = torch.exp(self.WA)
+
+        B_potentials = torch.exp(self.WB)
+        self.A = A_potentials  # Transition potentials
+        self.B = B_potentials  # Emission potentials
+
+        # Compute log-potentials
+        self.log_A = self.WA.repeat(self.k, 1) if self.unigram else self.WA
+        self.log_B = self.WB
 
     @override
     def train(self,
@@ -151,8 +154,6 @@ class ConditionalRandomField(HiddenMarkovModel):
         if minibatch_size > len(corpus):
             minibatch_size = len(corpus)  # no point in having a minibatch larger than the corpus
         min_steps = len(corpus)   # always do at least one epoch
-
-        self.init_params()    # initialize the parameters and call updateAB()
         self._zero_grad()     # get ready to accumulate their gradient
         steps = 0
         old_loss = _loss()    # evaluate initial loss
@@ -206,13 +207,16 @@ class ConditionalRandomField(HiddenMarkovModel):
         # Working with this desupervised version will let you sum over all taggings
         # in order to compute the normalizing constant for this sentence.
         desup_isent = self._integerize_sentence(sentence.desupervise(), corpus)
-        
-        # Compute forward pass for both supervised and desupervised sentences
-        alpha = self.forward_pass(isent)
-        Z = self.forward_pass(desup_isent)
 
-        # Calculate the conditional log-probability
-        log_prob = alpha.logsumexp(0) - Z.logsumexp(0)
+        # Compute log numerator (sum over paths consistent with the observed tags)
+        log_numerator = self.forward_pass(isent)
+
+        # Compute log Z(w), the normalization constant
+        log_Z = self.forward_pass(desup_isent)
+
+        # Compute the conditional log-probability
+        log_prob = log_numerator - log_Z
+
         return log_prob
 
     def accumulate_logprob_gradient(self, sentence: Sentence, corpus: TaggedCorpus) -> None:
@@ -230,11 +234,28 @@ class ConditionalRandomField(HiddenMarkovModel):
         # Just as in logprob()
         isent_sup   = self._integerize_sentence(sentence, corpus)
         isent_desup = self._integerize_sentence(sentence.desupervise(), corpus)
-        observed_counts = self.E_step(isent_sup, mult=1)
-        expected_counts = self.E_step(isent_desup, mult=1)
+
+        # Zero counts for this sentence
+        self._zero_counts()
+
+        # Compute observed counts from the supervised sentence
+        self._compute_observed_counts(isent_sup)
+
+        # Compute expected counts from the model
+        self.E_step(isent_desup, mult=-1)
+
+        if not hasattr(self, 'grad_WA'):
+            self.grad_WA = torch.zeros_like(self.WA)
+            self.grad_WB = torch.zeros_like(self.WB)
         
-        self.A_counts += observed_counts - expected_counts
-        self.B_counts += observed_counts - expected_counts
+        # For unigram, sum over rows
+        if self.unigram:
+            grad_WA = self.A_counts.sum(dim=0).unsqueeze(0)
+        else:
+            grad_WA = self.A_counts
+
+        self.grad_WA += grad_WA
+        self.grad_WB += self.B_counts
         
     def _zero_grad(self):
         """Reset the gradient accumulator to zero."""
@@ -246,15 +267,13 @@ class ConditionalRandomField(HiddenMarkovModel):
         """Update the parameters using the accumulated logprob gradient.
         lr is the learning rate (stepsize)."""
         
-        # Warning: Careful about how to handle the unigram case, where self.WA
-        # is only a vector of tag unigram potentials (even though self.A_counts
-        # is a still a matrix of tag bigram potentials).
-        
         if self.unigram:
-            self.WA += lr * self.A_counts.sum(dim=0)
+            # self.WA is [1,k], grad_WA is [1,k]
+            self.WA += lr * self.grad_WA
         else:
-            self.WA += lr * self.A_counts
-        self.WB += lr * self.B_counts
+            self.WA += lr * self.grad_WA
+        
+        self.WB += lr * self.grad_WB
         
     def reg_gradient_step(self, lr: float, reg: float, frac: float):
         """Update the parameters using the gradient of our regularizer.
@@ -267,12 +286,36 @@ class ConditionalRandomField(HiddenMarkovModel):
         
         if reg == 0: return      # can skip this step if we're not regularizing
 
-        # Warning: Be careful not to do something like w -= 0.1*w,
-        # because some of the weights are infinite and inf - inf = nan. 
-        # Instead, you want something like w *= 0.9.
+        # Decay factor
+        decay = 1 - 2 * lr * reg * frac
+        self.WA *= decay
+        self.WB *= decay
 
-        if reg > 0:
-            decay_factor = 1 - lr * reg * frac
-            self.WA *= decay_factor
-            self.WB *= decay_factor
+    def _compute_observed_counts(self, isent: IntegerizedSentence) -> None:
+        """Compute the observed counts from the supervised sentence and accumulate them into self.A_counts and self.B_counts."""
+        n = len(isent)
+        for j in range(1, n):
+            t_prev = isent[j - 1][1]
+            t_curr = isent[j][1]
+            w_curr = isent[j][0]
+
+            if t_prev is None or t_curr is None:
+                continue  # Skip if tags are missing
+
+            # Ensure indices are within bounds
+            if t_prev >= self.k or t_curr >= self.k:
+                continue  # Skip invalid tag indices
+
+            # Transition counts
+            if self.unigram:
+                self.A_counts[0, t_curr] += 1
+            else:
+                self.A_counts[t_prev, t_curr] += 1
+
+            # Emission counts
+            if w_curr < self.V:
+                self.B_counts[t_curr, w_curr] += 1
+            else:
+                # w_curr corresponds to BOS_WORD or EOS_WORD, which are not included in self.B_counts
+                pass  # No emission count is added for BOS_WORD or EOS_WORD
     
