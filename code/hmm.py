@@ -143,13 +143,12 @@ class HiddenMarkovModel:
         The `λ` parameter will be used for add-λ smoothing.
         We respect structural zeroes ("don't guess when you know")."""
         # Update emission probabilities (self.B)
-        ε = 1e-15  # Add a small epsilon for stability
 
         # Emission matrix B
         numerator_B = self.B_counts + λ
         numerator_B[self.eos_t, :] = 0
         numerator_B[self.bos_t, :] = 0
-        denominator_B = numerator_B.sum(dim=1, keepdim=True) + ε
+        denominator_B = numerator_B.sum(dim=1, keepdim=True)
         self.B = numerator_B / denominator_B
         self.B[self.bos_t, :] = 0
         self.B[self.eos_t, :] = 0
@@ -158,13 +157,13 @@ class HiddenMarkovModel:
         if self.unigram:
             total_counts_t = self.A_counts.sum(dim=0) + λ
             total_counts_t[self.bos_t] = 0
-            denominator_A = total_counts_t.sum() + ε
+            denominator_A = total_counts_t.sum()
             p_t = total_counts_t / denominator_A
             self.A = p_t.unsqueeze(0).repeat(self.k, 1)
         else:
             numerator_A = self.A_counts + λ
             numerator_A[:, self.bos_t] = 0
-            denominator_A = numerator_A.sum(dim=1, keepdim=True) + ε
+            denominator_A = numerator_A.sum(dim=1, keepdim=True)
             self.A = numerator_A / denominator_A
             self.A[:, self.bos_t] = 0  
         # Update transition probabilities (self.A).  

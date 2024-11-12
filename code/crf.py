@@ -22,6 +22,7 @@ from corpus import (BOS_TAG, BOS_WORD, EOS_TAG, EOS_WORD, Sentence, Tag,
                     TaggedCorpus, Word)
 from integerize import Integerizer
 from hmm import HiddenMarkovModel
+import torch.nn as nn
 
 TorchScalar = Float[Tensor, ""] # a Tensor with no dimensions, i.e., a scalar
 
@@ -45,15 +46,22 @@ class ConditionalRandomField(HiddenMarkovModel):
     
     @override
     def __init__(self, 
-                 tagset: Integerizer[Tag],
-                 vocab: Integerizer[Word],
-                 unigram: bool = False):
-        """Construct an CRF with initially random parameters, with the
-        given tagset, vocabulary, and lexical features.  See the super()
-        method for discussion."""
-
+             tagset: Integerizer[Tag],
+             vocab: Integerizer[Word],
+             unigram: bool = False):
+        """Construct a CRF with initially random parameters, with the
+        given tagset, vocabulary, and lexical features."""
+        
+        # Initialize WA and WB before calling super().__init__()
+        self.WA = torch.empty((1 if unigram else len(tagset), len(tagset)))
+        self.WB = torch.empty((len(tagset), len(vocab)))
+        
+        # Now call the parent constructor
         super().__init__(tagset, vocab, unigram)
 
+
+        self.init_params()
+        
     @override
     def init_params(self) -> None:
         """Initialize params self.WA and self.WB to small random values, and
@@ -65,8 +73,9 @@ class ConditionalRandomField(HiddenMarkovModel):
         # For a unigram model, self.WA should just have a single row:
         # that model has fewer parameters.
 
-        raise NotImplementedError   # you fill this in!
-        self.updateAB()   # compute potential matrices
+        nn.init.normal_(self.WA, mean=0, std=0.01)
+        nn.init.normal_(self.WB, mean=0, std=0.01)
+        self.updateAB()  # compute potential matrices
 
     def updateAB(self) -> None:
         """Set the transition and emission matrices self.A and self.B, 
@@ -78,7 +87,11 @@ class ConditionalRandomField(HiddenMarkovModel):
         # so that the forward-backward code will still work.
         # See init_params() in the parent class for discussion of this point.
         
-        raise NotImplementedError   # you fill this in!
+        if self.unigram:
+            self.A = self.WA.expand(len(self.tagset), -1)
+        else:
+            self.A = self.WA
+        self.B = self.WB
 
     @override
     def train(self,
@@ -193,8 +206,14 @@ class ConditionalRandomField(HiddenMarkovModel):
         # Working with this desupervised version will let you sum over all taggings
         # in order to compute the normalizing constant for this sentence.
         desup_isent = self._integerize_sentence(sentence.desupervise(), corpus)
+        
+        # Compute forward pass for both supervised and desupervised sentences
+        alpha = self.forward_pass(isent)
+        Z = self.forward_pass(desup_isent)
 
-        raise NotImplementedError   # you fill this in!
+        # Calculate the conditional log-probability
+        log_prob = alpha.logsumexp(0) - Z.logsumexp(0)
+        return log_prob
 
     def accumulate_logprob_gradient(self, sentence: Sentence, corpus: TaggedCorpus) -> None:
         """Add the gradient of self.logprob(sentence, corpus) into a total minibatch
@@ -211,9 +230,11 @@ class ConditionalRandomField(HiddenMarkovModel):
         # Just as in logprob()
         isent_sup   = self._integerize_sentence(sentence, corpus)
         isent_desup = self._integerize_sentence(sentence.desupervise(), corpus)
-
-        # Hint: use the mult argument to E_step().
-        raise NotImplementedError   # you fill this in!
+        observed_counts = self.E_step(isent_sup, mult=1)
+        expected_counts = self.E_step(isent_desup, mult=1)
+        
+        self.A_counts += observed_counts - expected_counts
+        self.B_counts += observed_counts - expected_counts
         
     def _zero_grad(self):
         """Reset the gradient accumulator to zero."""
@@ -229,7 +250,11 @@ class ConditionalRandomField(HiddenMarkovModel):
         # is only a vector of tag unigram potentials (even though self.A_counts
         # is a still a matrix of tag bigram potentials).
         
-        raise NotImplementedError   # you fill this in!
+        if self.unigram:
+            self.WA += lr * self.A_counts.sum(dim=0)
+        else:
+            self.WA += lr * self.A_counts
+        self.WB += lr * self.B_counts
         
     def reg_gradient_step(self, lr: float, reg: float, frac: float):
         """Update the parameters using the gradient of our regularizer.
@@ -246,5 +271,8 @@ class ConditionalRandomField(HiddenMarkovModel):
         # because some of the weights are infinite and inf - inf = nan. 
         # Instead, you want something like w *= 0.9.
 
-        raise NotImplementedError   # you fill this in!
+        if reg > 0:
+            decay_factor = 1 - lr * reg * frac
+            self.WA *= decay_factor
+            self.WB *= decay_factor
     
