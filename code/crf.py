@@ -231,7 +231,6 @@ class ConditionalRandomField(HiddenMarkovModel):
         # so you'll override this and accumulate the gradient using PyTorch's
         # backprop instead.)
         
-        # Just as in logprob()
         isent_sup   = self._integerize_sentence(sentence, corpus)
         isent_desup = self._integerize_sentence(sentence.desupervise(), corpus)
 
@@ -240,28 +239,50 @@ class ConditionalRandomField(HiddenMarkovModel):
 
         # Compute observed counts from the supervised sentence
         self._compute_observed_counts(isent_sup)
+        observed_A_counts = self.A_counts.clone()
+        observed_B_counts = self.B_counts.clone()
 
         # Compute expected counts from the model
-        self.E_step(isent_desup, mult=-1)
+        self._zero_counts()  # Reset counts before E_step
+        self.E_step(isent_desup)
+        expected_A_counts = self.A_counts.clone()
+        expected_B_counts = self.B_counts.clone()
 
+        # Compute gradients: observed counts - expected counts
+        grad_A_counts = observed_A_counts - expected_A_counts
+        grad_B_counts = observed_B_counts - expected_B_counts
+
+        # Initialize gradients if they don't exist
         if not hasattr(self, 'grad_WA'):
             self.grad_WA = torch.zeros_like(self.WA)
             self.grad_WB = torch.zeros_like(self.WB)
-        
+
         # For unigram, sum over rows
         if self.unigram:
-            grad_WA = self.A_counts.sum(dim=0).unsqueeze(0)
+            grad_WA = grad_A_counts.sum(dim=0).unsqueeze(0)
         else:
-            grad_WA = self.A_counts
+            grad_WA = grad_A_counts
 
+        # Accumulate gradients for the current sentence
         self.grad_WA += grad_WA
-        self.grad_WB += self.B_counts
+        self.grad_WB += grad_B_counts
+
+
         
     def _zero_grad(self):
         """Reset the gradient accumulator to zero."""
         # You'll have to override this method in the next homework; 
         # see comments in accumulate_logprob_gradient().
         self._zero_counts()
+    
+        # Reset gradients
+        if hasattr(self, 'grad_WA'):
+            self.grad_WA.zero_()
+            self.grad_WB.zero_()
+        else:
+            # Initialize gradients if they don't exist
+            self.grad_WA = torch.zeros_like(self.WA)
+            self.grad_WB = torch.zeros_like(self.WB)
 
     def logprob_gradient_step(self, lr: float) -> None:
         """Update the parameters using the accumulated logprob gradient.
