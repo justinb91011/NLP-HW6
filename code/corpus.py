@@ -81,7 +81,7 @@ class TaggedCorpus:
                  tagset: Optional[Integerizer[Tag]] = None, 
                  vocab: Optional[Integerizer[Word]] = None,
                  vocab_threshold: int = 1, 
-                 add_oov: bool = True):
+                 add_oov: bool = False):
         """Wrap the given set of files as a corpus. 
         Use the tagset and/or vocab from the parent corpus, if given.
         Otherwise they are derived as follows from the data in `files`:
